@@ -1,15 +1,19 @@
-// Camera -> guide-box crop -> OCR, all in this tab. Nothing is uploaded: the page only
-// downloads its own code and model, then reads frames locally.
+// Camera -> whole-frame OCR, all in this tab. Nothing is uploaded: the page only downloads
+// its own code and models, then reads frames locally.
 import * as ort from "./vendor/ort.wasm.min.mjs";
-import { createRecognizer, isAcceptable } from "./ocr.js";
+import { createPageReader } from "./page.js";
 
 ort.env.wasm.wasmPaths = new URL("./vendor/", import.meta.url).href;
 ort.env.wasm.numThreads = 1; // GitHub Pages cannot send COOP/COEP headers, so no wasm threads
 
+// Frames bigger than this are scaled down before reading: bounds the per-frame copy.
+const MAX_FRAME_SIDE = 2560;
+
 const $ = (id) => document.getElementById(id);
 const video = $("video");
-const crop = $("crop");
-const cropContext = crop.getContext("2d", { willReadFrequently: true });
+const overlay = $("boxes");
+const frame = document.createElement("canvas");
+const frameContext = frame.getContext("2d", { willReadFrequently: true });
 
 // Smallest valid module, and one using a v128 instruction (from wasm-feature-detect).
 const WASM_EMPTY = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
@@ -17,7 +21,7 @@ const WASM_SIMD = new Uint8Array([
   0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11,
 ]);
 
-const state = { recognizer: null, busy: false, frozen: false, last: 0, interval: 500, candidate: null, stable: "" };
+const state = { reader: null, busy: false, frozen: false, limit: 960, text: "", lines: [], frameSize: [0, 0] };
 
 function showError(error) {
   $("error").textContent = error instanceof Error ? error.message : String(error);
@@ -35,12 +39,12 @@ async function probe() {
   ];
 }
 
-function report(checks, selfTest) {
+function report(checks, summary) {
   $("checklist").replaceChildren(
     ...checks.map(([name, ok]) => Object.assign(document.createElement("li"), { textContent: `${ok ? "✓" : "✗"} ${name}` })),
     Object.assign(document.createElement("li"), { textContent: `UA: ${navigator.userAgent}` }),
   );
-  $("summary").textContent = selfTest;
+  $("summary").textContent = summary;
 }
 
 async function fetchOk(path, as) {
@@ -49,79 +53,85 @@ async function fetchOk(path, as) {
   return response[as]();
 }
 
-/** Reads a fixture line the Python runtime has already read, and compares. */
-async function selfTest(recognizer) {
+/** Reads a fixture page the Python runtime has already read, and compares. */
+async function selfTest(reader) {
   const expected = await fetchOk("fixtures/expected.json", "json");
-  const line = expected.lines[0];
-  const bitmap = await createImageBitmap(await fetchOk(`fixtures/${line.file}`, "blob"));
+  const page = expected.pages[0];
+  const bitmap = await createImageBitmap(await fetchOk(`fixtures/${page.file}`, "blob"));
   const canvas = Object.assign(document.createElement("canvas"), { width: bitmap.width, height: bitmap.height });
   const context = canvas.getContext("2d");
   context.drawImage(bitmap, 0, 0);
   const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
-  let reading;
-  for (let run = 0; run < 3; run++) reading = await recognizer.read(data, bitmap.width, bitmap.height); // last = warm
-  const ms = reading.prepMs + reading.inferMs + reading.decodeMs;
-  const verdict = reading.text === line.text ? "matches reference" : `MISMATCH: “${reading.text}”`;
-  return `Self-test ${verdict} · ${ms.toFixed(1)} ms per line (warm)`;
+  await reader.read(data, bitmap.width, bitmap.height, 1280); // warm-up
+  const reading = await reader.read(data, bitmap.width, bitmap.height, 1280);
+  const edits = editDistance([...reading.text], [...page.text]);
+  return `Self-test: ${reading.lines.length}/${page.lines} lines, ${edits} of ${[...page.text].length} characters ` +
+    `differ from the reference · detect ${reading.detMs.toFixed(0)} · read ${reading.recMs.toFixed(0)} ms`;
 }
 
-/** The guide box in video pixels; the video is drawn with object-fit: cover. */
-function guideInVideo() {
-  const view = video.getBoundingClientRect();
-  const guide = $("guide").getBoundingClientRect();
-  const scale = Math.max(view.width / video.videoWidth, view.height / video.videoHeight);
-  const offsetX = (view.width - video.videoWidth * scale) / 2;
-  const offsetY = (view.height - video.videoHeight * scale) / 2;
-  const x = Math.max(0, Math.round((guide.left - view.left - offsetX) / scale));
-  const y = Math.max(0, Math.round((guide.top - view.top - offsetY) / scale));
-  const w = Math.min(video.videoWidth - x, Math.round(guide.width / scale));
-  const h = Math.min(video.videoHeight - y, Math.round(guide.height / scale));
-  return { x, y, w, h };
-}
-
-/** Two acceptable readings in a row that agree; anything else resets the run. */
-function confirm(reading) {
-  if (!isAcceptable(reading.text, reading.confidence)) {
-    state.candidate = null;
-    return null;
+function editDistance(a, b) {
+  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j++) {
+      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    row = next;
   }
-  const confirmed = reading.text === state.candidate ? reading.text : null;
-  state.candidate = reading.text;
-  return confirmed;
+  return row[b.length];
+}
+
+/** Frame pixels -> overlay pixels, matching the video's object-fit: cover. */
+function drawBoxes() {
+  const { width, height } = overlay.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  overlay.width = Math.round(width * ratio);
+  overlay.height = Math.round(height * ratio);
+  const context = overlay.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const [fw, fh] = state.frameSize;
+  if (!fw || !fh) return;
+  const scale = Math.max(width / fw, height / fh);
+  const [ox, oy] = [(width - fw * scale) / 2, (height - fh * scale) / 2];
+  context.strokeStyle = "#30d158";
+  context.lineWidth = 2;
+  context.beginPath();
+  for (const { quad } of state.lines) {
+    quad.forEach(([x, y], i) => (i ? context.lineTo : context.moveTo).call(context, ox + x * scale, oy + y * scale));
+    context.closePath();
+  }
+  context.stroke();
 }
 
 async function readFrame() {
   const start = performance.now();
-  const { x, y, w, h } = guideInVideo();
-  if (w < 1 || h < 1) return;
-  crop.width = w;
-  crop.height = h;
-  cropContext.drawImage(video, x, y, w, h, 0, 0, w, h);
-  const { data } = cropContext.getImageData(0, 0, w, h);
-  const cropMs = performance.now() - start;
+  const shrink = Math.min(1, MAX_FRAME_SIDE / Math.max(video.videoWidth, video.videoHeight));
+  frame.width = Math.round(video.videoWidth * shrink);
+  frame.height = Math.round(video.videoHeight * shrink);
+  frameContext.drawImage(video, 0, 0, frame.width, frame.height);
+  const { data } = frameContext.getImageData(0, 0, frame.width, frame.height);
+  const frameMs = performance.now() - start;
 
-  const reading = await state.recognizer.read(data, w, h);
-  const confirmed = confirm(reading);
-  if (confirmed && confirmed !== state.stable) {
-    state.stable = confirmed;
-    $("stable").textContent = confirmed;
-    $("copy").disabled = false;
-  }
-  const filtered = isAcceptable(reading.text, reading.confidence) ? "" : " (filtered)";
-  $("last").textContent = `last ${reading.confidence.toFixed(2)}${filtered}: ${reading.text}`;
+  const reading = await state.reader.read(data, frame.width, frame.height, state.limit);
+  if (state.frozen) return;
+  state.text = reading.text;
+  state.lines = reading.lines;
+  state.frameSize = [frame.width, frame.height];
+  $("text").textContent = reading.text;
+  $("copy").disabled = !reading.text;
   $("timing").textContent =
-    `${w}×${h} px · crop ${cropMs.toFixed(1)} · prep ${reading.prepMs.toFixed(1)} · ` +
-    `infer ${reading.inferMs.toFixed(1)} · decode ${reading.decodeMs.toFixed(1)} · ` +
-    `total ${(performance.now() - start).toFixed(1)} ms`;
+    `${reading.lines.length} lines kept of ${reading.detected} found · ${frame.width}×${frame.height} px · ` +
+    `frame ${frameMs.toFixed(0)} · detect ${reading.detMs.toFixed(0)} · read ${reading.recMs.toFixed(0)} · ` +
+    `total ${(performance.now() - start).toFixed(0)} ms`;
   $("error").textContent = "";
+  drawBoxes();
 }
 
 /** One job at a time, latest frame only: frames that arrive while busy are skipped. */
-function loop(now) {
+function loop() {
   requestAnimationFrame(loop);
-  if (state.busy || state.frozen || now - state.last < state.interval || video.readyState < 2) return;
+  if (state.busy || state.frozen || video.readyState < 2) return;
   state.busy = true;
-  state.last = now;
   readFrame()
     .catch(showError)
     .finally(() => {
@@ -130,6 +140,7 @@ function loop(now) {
 }
 
 async function startCamera() {
+  $("start").disabled = true; // one camera request at a time
   video.srcObject = await navigator.mediaDevices.getUserMedia({
     audio: false,
     video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 } },
@@ -141,30 +152,39 @@ async function startCamera() {
   requestAnimationFrame(loop);
 }
 
-$("start").onclick = () => startCamera().catch(showError);
+$("start").onclick = () =>
+  startCamera().catch((error) => {
+    $("start").disabled = false;
+    showError(error);
+  });
 $("freeze").onclick = () => {
   state.frozen = !state.frozen;
   $("freeze").textContent = state.frozen ? "Resume" : "Freeze";
   if (state.frozen) video.pause();
   else video.play().catch(showError);
 };
-$("copy").onclick = () => navigator.clipboard.writeText(state.stable).catch(showError);
-$("rate").onchange = (event) => {
-  state.interval = Number(event.target.value);
+$("copy").onclick = () => navigator.clipboard.writeText(state.text).catch(showError);
+$("detail").onchange = (event) => {
+  state.limit = Number(event.target.value);
 };
+window.addEventListener("resize", drawBoxes);
 
 async function main() {
   const checks = await probe();
-  report(checks, "Loading model…");
+  report(checks, "Loading models…");
   if (!checks.find(([name]) => name === "WebAssembly")[1]) {
     report(checks, "WebAssembly is off, so OCR cannot run here.");
     throw new Error(
       "WebAssembly is blocked. If Lockdown Mode is on: page menu → Website Settings → turn off Lockdown Mode for this site, then reload.",
     );
   }
-  const [model, dictionary] = await Promise.all([fetchOk("model/rec.onnx", "arrayBuffer"), fetchOk("model/rec_dict.txt", "text")]);
-  state.recognizer = await createRecognizer(ort, model, dictionary);
-  report(checks, await selfTest(state.recognizer));
+  const [det, rec, dictionary] = await Promise.all([
+    fetchOk("model/det.onnx", "arrayBuffer"),
+    fetchOk("model/rec.onnx", "arrayBuffer"),
+    fetchOk("model/rec_dict.txt", "text"),
+  ]);
+  state.reader = await createPageReader(ort, det, rec, dictionary);
+  report(checks, await selfTest(state.reader));
   $("start").disabled = !checks.find(([name]) => name.startsWith("Camera"))[1];
 }
 

@@ -8,22 +8,21 @@
     :root { color-scheme: dark; font-family: -apple-system, system-ui, sans-serif; }
     body { margin: 0; background: #000; color: #fff; }
     #stage { position: fixed; inset: 0; }
-    video { width: 100%; height: 100%; object-fit: cover; display: block; }
-    #guide {
-      position: absolute; left: 20px; right: 20px; top: calc(32% - 36px); height: 72px;
-      border: 3px solid #ffd60a; border-radius: 8px; box-sizing: border-box;
-    }
+    video, #boxes { position: absolute; inset: 0; width: 100%; height: 100%; }
+    video { object-fit: cover; display: block; }
     #panel {
       position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
       display: grid; gap: 8px; max-height: 58vh; overflow: auto; padding: 14px;
       background: rgba(28, 28, 30, 0.88); backdrop-filter: blur(12px); border-radius: 16px;
     }
-    #stable { font-size: 1.5rem; min-height: 1.4em; user-select: text; -webkit-user-select: text; }
-    #stable:empty::before { content: "Fit one printed line inside the yellow box"; color: #8e8e93; }
+    #text {
+      max-height: 30vh; overflow: auto; white-space: pre-wrap; font-size: 1.05rem; line-height: 1.5;
+      user-select: text; -webkit-user-select: text;
+    }
+    #text:empty::before { content: "Point the camera at printed text"; color: #8e8e93; }
     .small { font-size: 0.8rem; color: #aeaeb2; font-variant-numeric: tabular-nums; }
-    #crop { height: 36px; max-width: 100%; justify-self: start; }
     #error { color: #ff453a; }
-    #error:empty, #crop:not([width]) { display: none; }
+    #error:empty, #timing:empty { display: none; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     button, select { font: inherit; padding: 8px 14px; border: 0; border-radius: 10px; background: #0a84ff; color: #fff; }
     button:disabled { opacity: 0.4; }
@@ -34,23 +33,21 @@
 <body>
   <div id="stage">
     <video id="video" playsinline muted></video>
-    <div id="guide"></div>
+    <canvas id="boxes"></canvas>
   </div>
   <div id="panel">
     <div id="error"></div>
-    <div id="stable"></div>
-    <canvas id="crop"></canvas>
-    <div id="last" class="small"></div>
+    <div id="text"></div>
     <div id="timing" class="small"></div>
     <div class="row">
       <button id="start" disabled>Start camera</button>
       <button id="freeze" disabled>Freeze</button>
       <button id="copy" disabled>Copy</button>
-      <label class="small">OCR
-        <select id="rate">
-          <option value="500">2/s</option>
-          <option value="200">5/s</option>
-          <option value="0">Max</option>
+      <label class="small">Detail
+        <select id="detail">
+          <option value="736">Fast 736</option>
+          <option value="960" selected>Medium 960</option>
+          <option value="1280">Fine 1280</option>
         </select>
       </label>
     </div>

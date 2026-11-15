@@ -6,6 +6,7 @@ import { test } from "node:test";
 import * as ort from "onnxruntime-web";
 import { PNG } from "pngjs";
 import { clean, createRecognizer, isAcceptable } from "../ocr.js";
+import { createPageReader, minAreaRect } from "../page.js";
 
 const root = new URL("../../OCRCore/", import.meta.url);
 const fixtures = new URL("Tests/OCRCoreTests/Fixtures/", root);
@@ -26,6 +27,42 @@ test("reads lines like the reference runtime", async () => {
     assert.equal(reading.text, line.text, line.file);
     assert.ok(Math.abs(reading.confidence - line.confidence) < 0.01, `${line.file}: ${reading.confidence}`);
   }
+});
+
+// Same lines, near-same text. Boxes agree with the runtime's within 1-2 px, but it rounds
+// through integers (cv2 fixed-point resize, pyclipper), and a line's last glyph can read
+// differently over 1 px. So: exact line count, and at most 2 % of characters differing.
+test("reads pages like the reference runtime", async () => {
+  const reader = await createPageReader(
+    ort,
+    readFileSync(new URL("det.onnx", model)),
+    readFileSync(new URL("rec.onnx", model)),
+    readFileSync(new URL("rec_dict.txt", model), "utf8"),
+  );
+  for (const page of expected.pages) {
+    const png = PNG.sync.read(readFileSync(new URL(page.file, fixtures)));
+    const reading = await reader.read(png.data, png.width, png.height, 1280);
+    assert.equal(reading.lines.length, page.lines, page.file);
+    const edits = editDistance([...reading.text], [...page.text]);
+    assert.ok(edits <= 0.02 * [...page.text].length, `${page.file}: ${edits} edits\n${reading.text}`);
+  }
+});
+
+function editDistance(a, b) {
+  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j++) {
+      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    row = next;
+  }
+  return row[b.length];
+}
+
+test("a one-pixel region gives an empty rect instead of failing", () => {
+  const rect = minAreaRect([[5, 7], [5, 7]]); // a 1-pixel region: leftmost = rightmost
+  assert.equal(Math.min(rect.w, rect.h), 0);
 });
 
 test("clean matches reference canonical() and fix_scripts()", () => {

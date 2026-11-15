@@ -24,6 +24,11 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Thai OCR
-        INFOPLIST_KEY_NSCameraUsageDescription: Reads printed text inside the guide box. Frames are processed on this iPhone and never leave it.
+        INFOPLIST_KEY_NSCameraUsageDescription: Reads printed text in the camera view. Frames are processed on this iPhone and never leave it.
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+schemes:
+  RealtimeOCR:
+    build:
+      targets:
+        RealtimeOCR: all

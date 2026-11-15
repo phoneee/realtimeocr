@@ -15,13 +15,9 @@ enum LinePreprocess {
         let width: Int
     }
 
-    enum Failure: Error {
-        case emptyImage
-        case bitmapContext
-    }
-
-    static func tensor(from image: CGImage) throws -> Tensor {
-        let (gray, w, h) = try luma(image)
+    static func tensor(from image: RGBAImage) -> Tensor {
+        let (w, h) = (image.width, image.height)
+        let gray = luma(image)
         let lineWidth = min(maxWidth, max(1, Int((Double(height) * Double(w) / Double(h)).rounded(.up))))
         let small = resizeBilinear(gray, width: w, height: h, toWidth: lineWidth, toHeight: height)
         let flat = flatten(small, width: lineWidth, height: height)
@@ -40,26 +36,12 @@ enum LinePreprocess {
         return Tensor(values: values, width: width)
     }
 
-    /// Luma per pixel, row 0 = top, as cv2.COLOR_BGR2GRAY weights.
-    static func luma(_ image: CGImage) throws -> (pixels: [Float], width: Int, height: Int) {
-        let w = image.width
-        let h = image.height
-        guard w > 0, h > 0 else { throw Failure.emptyImage }
-        var rgba = [UInt8](repeating: 0, count: w * h * 4)
-        let drawn = rgba.withUnsafeMutableBytes { buffer -> Bool in
-            guard let context = CGContext(
-                data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-            ) else { return false }
-            context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-            return true
+    /// Luma per pixel, as cv2.COLOR_BGR2GRAY weights.
+    static func luma(_ image: RGBAImage) -> [Float] {
+        let px = image.pixels
+        return (0..<(image.width * image.height)).map { i in
+            0.299 * Float(px[4 * i]) + 0.587 * Float(px[4 * i + 1]) + 0.114 * Float(px[4 * i + 2])
         }
-        guard drawn else { throw Failure.bitmapContext }
-        let pixels = (0..<(w * h)).map { i in
-            0.299 * Float(rgba[4 * i]) + 0.587 * Float(rgba[4 * i + 1]) + 0.114 * Float(rgba[4 * i + 2])
-        }
-        return (pixels, w, h)
     }
 
     /// cv2.resize INTER_LINEAR: half-pixel centres, two taps per axis, no antialiasing.

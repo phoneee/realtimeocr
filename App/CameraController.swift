@@ -3,51 +3,51 @@ import CoreImage
 import OCRCore
 import UIKit
 
-/// Camera frames -> guide-box crop -> LineRecognizer. One job at a time, latest frame only:
+/// Camera frames -> whole-frame OCR (PageReader). One job at a time, latest frame only:
 /// work runs on the frame queue, and AVFoundation drops frames that arrive while it is busy.
 final class CameraController: NSObject, ObservableObject {
-    enum Rate: String, CaseIterable, Identifiable {
-        case two = "2/s", five = "5/s", max = "Max"
+    /// The detector's long side: speed against small text.
+    enum Detail: Int, CaseIterable, Identifiable {
+        case fast = 736, medium = 960, fine = 1280
 
         var id: Self { self }
 
-        var minInterval: CFTimeInterval {
+        var label: String {
             switch self {
-            case .two: 0.5
-            case .five: 0.2
-            case .max: 0
+            case .fast: "Fast"
+            case .medium: "Medium"
+            case .fine: "Fine"
             }
         }
     }
 
     struct Status {
-        var reading: LineReading?
-        var cropMs = 0.0
+        var reading: PageReading?
+        var frameSize = CGSize.zero
+        var renderMs = 0.0
         var totalMs = 0.0
-        var cropSize = CGSize.zero
-        var crop: UIImage?
     }
 
     enum SetupError: LocalizedError {
-        case cameraDenied, noCamera, cannotAttach
+        case cameraDenied, noCamera, cannotAttach, cannotRender
 
         var errorDescription: String? {
             switch self {
             case .cameraDenied: "Camera access is off. Allow it in Settings → Thai OCR."
             case .noCamera: "No back camera found."
             case .cannotAttach: "Could not attach the camera to the capture session."
+            case .cannotRender: "Could not convert a camera frame."
             }
         }
     }
 
-    @Published private(set) var stableText = ""
     @Published private(set) var status = Status()
     @Published private(set) var errorMessage: String?
     @Published var isFrozen = false {
         didSet { let frozen = isFrozen; queue.async { self.frozen = frozen } }
     }
-    @Published var rate = Rate.two {
-        didSet { let interval = rate.minInterval; queue.async { self.minInterval = interval } }
+    @Published var detail = Detail.medium {
+        didSet { let limit = detail.rawValue; queue.async { self.limit = limit } }
     }
 
     let session = AVCaptureSession()
@@ -55,28 +55,24 @@ final class CameraController: NSObject, ObservableObject {
     private let ciContext = CIContext()
 
     // Touched only on `queue`.
-    private var recognizer: LineRecognizer?
-    private var guide = CGRect.zero // normalized, unrotated sensor picture, top-left origin
+    private var reader: PageReader?
     private var frozen = false
-    private var minInterval = Rate.two.minInterval
-    private var lastRun: CFTimeInterval = 0
-    private var candidate: String?
+    private var limit = Detail.medium.rawValue
+
+    private var started = false // main thread
 
     func start() {
+        guard !started else { return } // onAppear can fire again; the session takes one input
+        started = true
         AVCaptureDevice.requestAccess(for: .video) { granted in
             guard granted else { return self.publish(SetupError.cameraDenied) }
             self.queue.async { self.configureAndRun() }
         }
     }
 
-    /// `rect` from AVCaptureVideoPreviewLayer.metadataOutputRectConverted(fromLayerRect:).
-    func setGuide(_ rect: CGRect) {
-        queue.async { self.guide = rect }
-    }
-
     private func configureAndRun() {
         do {
-            recognizer = try LineRecognizer()
+            reader = try PageReader()
             try configureSession()
             session.startRunning()
         } catch {
@@ -96,7 +92,7 @@ final class CameraController: NSObject, ObservableObject {
         guard session.canAddInput(input), session.canAddOutput(output) else { throw SetupError.cannotAttach }
         session.addInput(input)
         session.addOutput(output)
-        // Small print needs pixels: the crop is a thin strip of the frame.
+        // Small print needs pixels: lines are cut from the full-resolution frame.
         // Checked after the input is attached, since what is supported depends on the camera.
         session.sessionPreset = session.canSetSessionPreset(.hd4K3840x2160) ? .hd4K3840x2160 : .hd1920x1080
 
@@ -117,26 +113,12 @@ final class CameraController: NSObject, ObservableObject {
         return types.lazy.compactMap { AVCaptureDevice.default($0, for: .video, position: .back) }.first
     }
 
-    /// The guide box cut from the frame and turned upright (back camera, portrait UI).
-    private func cropGuide(from pixels: CVPixelBuffer) -> CGImage? {
-        let frame = CIImage(cvPixelBuffer: pixels)
-        let w = frame.extent.width
-        let h = frame.extent.height
-        let rect = CGRect(x: guide.minX * w, y: (1 - guide.maxY) * h, width: guide.width * w, height: guide.height * h)
-            .integral // Core Image's origin is bottom-left
-        guard rect.width >= 1, rect.height >= 1 else { return nil }
-        let upright = frame.cropped(to: rect).oriented(.right)
-        return ciContext.createCGImage(upright, from: upright.extent)
-    }
-
-    /// Two acceptable readings in a row that agree; anything else resets the run.
-    private func confirm(_ reading: LineReading) -> String? {
-        guard reading.isAcceptable else {
-            candidate = nil
-            return nil
-        }
-        defer { candidate = reading.text }
-        return reading.text == candidate ? reading.text : nil
+    /// The frame turned upright (back camera, portrait UI), as RGBA.
+    // ponytail: via CGImage, the path the tests cover. Render straight to a bitmap if this shows up in timings.
+    private func uprightFrame(_ pixels: CVPixelBuffer) throws -> RGBAImage {
+        let upright = CIImage(cvPixelBuffer: pixels).oriented(.right)
+        guard let image = ciContext.createCGImage(upright, from: upright.extent) else { throw SetupError.cannotRender }
+        return try RGBAImage(image)
     }
 
     private func publish(_ error: Error) {
@@ -147,26 +129,20 @@ final class CameraController: NSObject, ObservableObject {
 
 extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard !frozen, let reader, let pixels = sampleBuffer.imageBuffer else { return }
         let start = CACurrentMediaTime()
-        guard !frozen, let recognizer, !guide.isEmpty, start - lastRun >= minInterval,
-              let pixels = sampleBuffer.imageBuffer, let crop = cropGuide(from: pixels)
-        else { return }
-        lastRun = start
-        let cropMs = (CACurrentMediaTime() - start) * 1000
         do {
-            let reading = try recognizer.read(crop)
-            let confirmed = confirm(reading)
+            let frame = try uprightFrame(pixels)
+            let renderMs = (CACurrentMediaTime() - start) * 1000
+            let reading = try reader.read(frame, limit: limit)
             let status = Status(
-                reading: reading, cropMs: cropMs, totalMs: (CACurrentMediaTime() - start) * 1000,
-                cropSize: CGSize(width: crop.width, height: crop.height), crop: UIImage(cgImage: crop)
+                reading: reading, frameSize: CGSize(width: frame.width, height: frame.height),
+                renderMs: renderMs, totalMs: (CACurrentMediaTime() - start) * 1000
             )
             DispatchQueue.main.async {
                 guard !self.isFrozen else { return }
                 self.errorMessage = nil // a read worked again; setup errors never get here (no frames)
                 self.status = status
-                if let confirmed, confirmed != self.stableText {
-                    self.stableText = confirmed
-                }
             }
         } catch {
             publish(error)

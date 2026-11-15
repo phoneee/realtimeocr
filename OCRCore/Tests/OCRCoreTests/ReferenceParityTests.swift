@@ -20,7 +20,14 @@ final class ReferenceParityTests: XCTestCase {
             let output: String
         }
 
+        struct Page: Decodable {
+            let file: String
+            let text: String
+            let lines: Int
+        }
+
         let lines: [Line]
+        let pages: [Page]
         let canonical: [Case]
     }
 
@@ -46,10 +53,42 @@ final class ReferenceParityTests: XCTestCase {
         }
     }
 
+    /// Same lines, near-same text. Boxes agree with the runtime's within 1-2 px, but it rounds
+    /// through integers (cv2 fixed-point resize, pyclipper), and a line's last glyph can read
+    /// differently over 1 px. So: exact line count, and at most 2 % of characters differing.
+    func testReadsPagesLikeReferenceRuntime() throws {
+        let reader = try PageReader()
+        for page in try expected().pages {
+            let reading = try reader.read(RGBAImage(image(page.file)), limit: 1280)
+            XCTAssertEqual(reading.lines.count, page.lines, page.file)
+            let edits = Self.editDistance(Array(reading.text.unicodeScalars), Array(page.text.unicodeScalars))
+            XCTAssertLessThanOrEqual(Double(edits), 0.02 * Double(page.text.unicodeScalars.count), "\(page.file):\n\(reading.text)")
+        }
+    }
+
+    private static func editDistance<T: Equatable>(_ a: [T], _ b: [T]) -> Int {
+        var row = Array(0...b.count)
+        for i in 1...max(a.count, 1) where !a.isEmpty {
+            var previous = row[0]
+            row[0] = i
+            for j in 1...max(b.count, 1) where !b.isEmpty {
+                let current = row[j]
+                row[j] = min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] == b[j - 1] ? 0 : 1))
+                previous = current
+            }
+        }
+        return a.isEmpty ? b.count : row[b.count]
+    }
+
     func testCleanMatchesReferenceCanonicalAndScriptFixes() throws {
         for item in try expected().canonical {
             XCTAssertEqual(ThaiText.clean(item.input), item.output, item.input.debugDescription)
         }
+    }
+
+    func testOnePixelRegionGivesEmptyRectInsteadOfCrashing() {
+        let speckle = CGPoint(x: 5, y: 7)
+        XCTAssertEqual(Geometry.minAreaRect([speckle, speckle]).side, 0) // a 1-pixel region: leftmost = rightmost
     }
 
     func testRejectsLowConfidenceShortAndBrokenThai() {

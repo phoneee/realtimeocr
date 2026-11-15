@@ -38,28 +38,30 @@ public final class LineRecognizer {
     private let classes: [String]
 
     // ponytail: plain CPU EP, 2 threads (A16 has 2 performance cores). Compare XNNPACK / Core ML EPs once on-device timings are in.
-    public init(threads: Int32 = 2) throws {
-        guard let model = Bundle.module.url(forResource: "rec", withExtension: "onnx", subdirectory: "Model") else {
-            throw Failure.missingResource("rec.onnx")
-        }
-        guard let dictionary = Bundle.module.url(forResource: "rec_dict", withExtension: "txt", subdirectory: "Model") else {
-            throw Failure.missingResource("rec_dict.txt")
-        }
-        let entries = try String(contentsOf: dictionary, encoding: .utf8).unicodeScalars
+    public convenience init(threads: Int32 = 2) throws {
+        try self.init(env: ORTEnv(loggingLevel: .warning), threads: threads)
+    }
+
+    init(env: ORTEnv, threads: Int32) throws {
+        let entries = try String(contentsOf: ModelFile.url("rec_dict", "txt"), encoding: .utf8).unicodeScalars
             .split(separator: "\n")
             .map { String(String.UnicodeScalarView($0)) }
         classes = [""] + entries + [" "]
 
-        env = try ORTEnv(loggingLevel: .warning)
+        self.env = env
         let options = try ORTSessionOptions()
         try options.setIntraOpNumThreads(threads)
         try options.setGraphOptimizationLevel(.all)
-        session = try ORTSession(env: env, modelPath: model.path, sessionOptions: options)
+        session = try ORTSession(env: env, modelPath: ModelFile.url("rec", "onnx").path, sessionOptions: options)
     }
 
     public func read(_ image: CGImage) throws -> LineReading {
+        try read(RGBAImage(image))
+    }
+
+    public func read(_ image: RGBAImage) throws -> LineReading {
         let start = DispatchTime.now()
-        let tensor = try LinePreprocess.tensor(from: image)
+        let tensor = LinePreprocess.tensor(from: image)
         let prepared = DispatchTime.now()
 
         let data = tensor.values.withUnsafeBufferPointer {

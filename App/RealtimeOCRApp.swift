@@ -10,9 +10,15 @@ struct RealtimeOCRApp: App {
 struct ContentView: View {
     @StateObject private var camera = CameraController()
 
+    private var text: String { camera.status.reading?.text ?? "" }
+
     var body: some View {
         ZStack(alignment: .bottom) {
-            CameraPreview(camera: camera, isFrozen: camera.isFrozen).ignoresSafeArea()
+            CameraPreview(
+                camera: camera, isFrozen: camera.isFrozen,
+                boxes: camera.status.reading?.lines.map(\.quad) ?? [], frameSize: camera.status.frameSize
+            )
+            .ignoresSafeArea()
             panel
         }
         .onAppear { camera.start() }
@@ -23,20 +29,23 @@ struct ContentView: View {
             if let message = camera.errorMessage {
                 Text(message).foregroundStyle(.red)
             }
-            Text(camera.stableText.isEmpty ? "Fit one printed line inside the yellow box" : camera.stableText)
-                .font(.title2)
-                .foregroundStyle(camera.stableText.isEmpty ? .secondary : .primary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            ScrollView {
+                Text(text.isEmpty ? "Point the camera at printed text" : text)
+                    .font(.body)
+                    .foregroundStyle(text.isEmpty ? .secondary : .primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 260)
             diagnostics
-            Picker("OCR rate", selection: $camera.rate) {
-                ForEach(CameraController.Rate.allCases) { Text($0.rawValue).tag($0) }
+            Picker("Detail", selection: $camera.detail) {
+                ForEach(CameraController.Detail.allCases) { Text("\($0.label) \($0.rawValue)").tag($0) }
             }
             .pickerStyle(.segmented)
             HStack {
                 Button(camera.isFrozen ? "Resume" : "Freeze") { camera.isFrozen.toggle() }
-                Button("Copy") { UIPasteboard.general.string = camera.stableText }
-                    .disabled(camera.stableText.isEmpty)
+                Button("Copy") { UIPasteboard.general.string = text }
+                    .disabled(text.isEmpty)
             }
             .buttonStyle(.borderedProminent)
         }
@@ -45,20 +54,14 @@ struct ContentView: View {
         .padding()
     }
 
-    /// What the model saw last, what it read, and where the time went.
+    /// How many lines were found and kept, and where the time went.
     @ViewBuilder private var diagnostics: some View {
         let status = camera.status
-        if let crop = status.crop {
-            Image(uiImage: crop).resizable().scaledToFit().frame(maxHeight: 36)
-        }
         if let reading = status.reading {
-            Text(String(format: "last %.2f%@: %@", reading.confidence, reading.isAcceptable ? "" : " (filtered)", reading.text))
-                .font(.caption)
-                .lineLimit(1)
             Text(String(
-                format: "%.0f×%.0f px · crop %.1f · prep %.1f · infer %.1f · decode %.1f · total %.1f ms",
-                status.cropSize.width, status.cropSize.height, status.cropMs,
-                reading.prepMs, reading.inferMs, reading.decodeMs, status.totalMs
+                format: "%d lines kept of %d found · %.0f×%.0f px · frame %.0f · detect %.0f · read %.0f · total %.0f ms",
+                reading.lines.count, reading.detected, status.frameSize.width, status.frameSize.height,
+                status.renderMs, reading.detMs, reading.recMs, status.totalMs
             ))
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.secondary)
