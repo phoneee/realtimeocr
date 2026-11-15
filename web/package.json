@@ -1,0 +1,15 @@
+{
+  "name": "realtimeocr-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "build": "rm -rf dist && mkdir -p dist/vendor && cp index.html app.js ocr.js dist/ && cp node_modules/onnxruntime-web/dist/ort.wasm.min.mjs node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm dist/vendor/ && cp -R ../OCRCore/Sources/OCRCore/Model dist/model && cp -R ../OCRCore/Tests/OCRCoreTests/Fixtures dist/fixtures"
+  },
+  "dependencies": {
+    "onnxruntime-web": "1.31.1"
+  },
+  "devDependencies": {
+    "pngjs": "7.0.0"
+  }
+}
