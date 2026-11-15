@@ -1,0 +1,7 @@
+.DS_Store
+build/
+*.xcodeproj/
+OCRCore/.build/
+OCRCore/.swiftpm/
+web/node_modules/
+web/dist/
